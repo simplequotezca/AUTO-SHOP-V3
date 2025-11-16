@@ -1,14 +1,16 @@
-import os
-import json
-import re
-import uuid
-import datetime
-from typing import Dict, Optional, List
-
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import Response
 from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
+import datetime
+import os
+import json
+import httpx
+from typing import Dict, Optional, List
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import re
+import uuid
 
 from sqlalchemy import (
     create_engine,
@@ -19,47 +21,48 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
+import stripe
 
-from openai import OpenAI
-
-# ---------------------------------------------------------
-# OPTIONAL GOOGLE CALENDAR SUPPORT
-# ---------------------------------------------------------
+# Optional PDF support (won't crash if not installed)
 try:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
-    GOOGLE_AVAILABLE = True
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
 except ImportError:
-    GOOGLE_AVAILABLE = False
+    REPORTLAB_AVAILABLE = False
 
+# ============================================================
+# DATABASE & STRIPE CONFIG (POSTGRESQL via DATABASE_URL)
+# ============================================================
 
-# ---------------------------------------------------------
-# APP + CONFIG
-# ---------------------------------------------------------
-
-app = FastAPI()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
-
-# DB: prefer Railway Postgres via DATABASE_URL, fallback to local sqlite
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not DATABASE_URL:
-    # Fallback (ephemeral in Railway, but lets the app boot if DB not set)
-    DATABASE_URL = "sqlite:///./auto_shop.db"
+    raise RuntimeError(
+        "DATABASE_URL is not set. On Railway, add it in the Variables tab, "
+        "pointing to your Postgres instance connection string."
+    )
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
-# In-memory session store for SMS booking flows
-SESSIONS: Dict[str, dict] = {}
+STRIPE_API_KEY = os.getenv("STRIPE_API_KEY")
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")  # subscription price id
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
+if STRIPE_API_KEY:
+    stripe.api_key = STRIPE_API_KEY
 
-# ---------------------------------------------------------
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # for dashboard API auth
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+app = FastAPI()
+
+# ============================================================
 # SHOP CONFIG
-# ---------------------------------------------------------
+# ============================================================
+
 
 class ShopConfig(BaseModel):
     id: str
@@ -69,52 +72,39 @@ class ShopConfig(BaseModel):
 
 
 def load_shops() -> Dict[str, ShopConfig]:
-    """
-    Load shops from SHOPS_JSON env var.
-
-    Example:
-    [
-      {
-        "id": "sj_auto_body",
-        "name": "SJ Auto Body",
-        "calendar_id": null,
-        "webhook_token": "shop_sj_84k2p1"
-      }
-    ]
-    """
     raw = os.getenv("SHOPS_JSON")
     if not raw:
-        # Default single shop if nothing configured
-        default = ShopConfig(
-            id="default",
-            name="Auto Body Shop",
-            calendar_id=None,
-            webhook_token="shop_default",
-        )
-        return {default.webhook_token: default}
-
+        return {}
     data = json.loads(raw)
-    shops = [ShopConfig(**s) for s in data]
-    return {s.webhook_token: s for s in shops}
+    return {s["webhook_token"]: ShopConfig(**s) for s in data}
 
 
 SHOPS_BY_TOKEN: Dict[str, ShopConfig] = load_shops()
+SESSIONS: Dict[str, dict] = {}
 
 
 def get_shop(request: Request) -> ShopConfig:
+    """
+    Resolve shop from the `?token=...` query parameter.
+    """
     if not SHOPS_BY_TOKEN:
-        raise HTTPException(status_code=500, detail="No shops configured")
-
+        # Fallback single-shop config so local dev still works
+        return ShopConfig(
+            id="default",
+            name="Auto Body Shop",
+            calendar_id=None,
+            webhook_token=""
+        )
     token = request.query_params.get("token")
     if not token or token not in SHOPS_BY_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid or missing shop token")
-
     return SHOPS_BY_TOKEN[token]
 
 
-# ---------------------------------------------------------
-# DB MODELS
-# ---------------------------------------------------------
+# ============================================================
+# DATABASE MODELS
+# ============================================================
+
 
 class Estimate(Base):
     __tablename__ = "estimates"
@@ -134,10 +124,6 @@ class Estimate(Base):
 
 
 class ShopBilling(Base):
-    """
-    Placeholder for future Stripe billing integration.
-    Not actively used yet, but schema is ready.
-    """
     __tablename__ = "shop_billing"
 
     shop_id = Column(String, primary_key=True)
@@ -147,22 +133,20 @@ class ShopBilling(Base):
 
 
 @app.on_event("startup")
-def on_startup():
+def on_startup() -> None:
+    # Create tables if they do not exist
     Base.metadata.create_all(bind=engine)
 
 
-# ---------------------------------------------------------
+# ============================================================
 # GOOGLE CALENDAR (OPTIONAL)
-# ---------------------------------------------------------
+# ============================================================
+
 
 def get_calendar_service():
-    if not GOOGLE_AVAILABLE:
-        return None
-
     sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not sa_path or not os.path.exists(sa_path):
         return None
-
     creds = service_account.Credentials.from_service_account_file(
         sa_path,
         scopes=["https://www.googleapis.com/auth/calendar"],
@@ -170,12 +154,7 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-def create_calendar_event(
-    shop: ShopConfig,
-    start_dt: datetime.datetime,
-    end_dt: datetime.datetime,
-    phone: str,
-):
+def create_calendar_event(shop: ShopConfig, start_dt, end_dt, phone: str):
     service = get_calendar_service()
     if not service or not shop.calendar_id:
         return None
@@ -189,15 +168,15 @@ def create_calendar_event(
 
     created = service.events().insert(
         calendarId=shop.calendar_id,
-        body=event,
+        body=event
     ).execute()
 
     return created.get("id")
 
 
-# ---------------------------------------------------------
-# HELPERS: IMAGES & VIN
-# ---------------------------------------------------------
+# ============================================================
+# HELPERS: IMAGES + VIN
+# ============================================================
 
 VIN_PATTERN = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
 
@@ -224,42 +203,15 @@ def extract_vin(text: str) -> Optional[str]:
     return None
 
 
-def get_appointment_slots(n: int = 3) -> List[datetime.datetime]:
-    now = datetime.datetime.now()
-    tomorrow = now + datetime.timedelta(days=1)
-    hours = [9, 11, 14, 16]
-
-    slots: List[datetime.datetime] = []
-    for h in hours:
-        dt = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
-        if dt > now:
-            slots.append(dt)
-    return slots[:n]
+# ============================================================
+# AI DAMAGE ESTIMATION (MULTI-IMAGE, ONTARIO 2025)
+# ============================================================
 
 
-# ---------------------------------------------------------
-# OPENAI CLIENT
-# ---------------------------------------------------------
-
-client: Optional[OpenAI] = None
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-async def estimate_damage_from_images(
-    image_urls: List[str],
-    vin: Optional[str],
-    shop: ShopConfig,
-) -> dict:
-    """
-    High-accuracy estimator using gpt-4o.
-    Ontario 2025 pricing calibrated in the prompt.
-    Returns a dict with:
-      severity, damage_areas, damage_types, recommended_repairs,
-      min_cost, max_cost, confidence, vin_used
-    """
-    if not client:
-        # Fallback if OPENAI_API_KEY not set
+async def estimate_damage_from_images(image_urls: List[str], vin: Optional[str], shop: ShopConfig):
+    api_key = OPENAI_API_KEY
+    if not api_key:
+        # Basic fallback so the system still works in demo mode
         return {
             "severity": "Moderate",
             "damage_areas": [],
@@ -372,63 +324,70 @@ Return strictly this JSON (no extra text):
 }
 """
 
-    # Build multimodal content
-    user_content: List[dict] = []
-    base_text = "Analyze all uploaded vehicle damage photos and follow the instructions."
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    content: List[dict] = []
+    main_text = "Analyze all uploaded vehicle damage photos and follow the instructions."
     if vin:
-        base_text += f" The VIN for this vehicle is: {vin}."
-    user_content.append({"type": "text", "text": base_text})
+        main_text += f" The VIN for this vehicle is: {vin}."
+    content.append({"type": "text", "text": main_text})
 
     for url in image_urls:
-        user_content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": url},
-            }
-        )
+        content.append({"type": "image_url", "image_url": {"url": url}})
+
+    payload = {
+        "model": "gpt-4.1",
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": content},
+        ],
+        "response_format": {"type": "json_object"},
+    }
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format={"type": "json_object"},
-        )
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        output = json.loads(data["choices"][0]["message"]["content"])
 
-        raw = response.choices[0].message.content
-        result = json.loads(raw)
+        output.setdefault("severity", "Moderate")
+        output.setdefault("damage_areas", [])
+        output.setdefault("damage_types", [])
+        output.setdefault("recommended_repairs", [])
+        output.setdefault("min_cost", 600)
+        output.setdefault("max_cost", 1500)
+        output.setdefault("confidence", 0.70)
+        output.setdefault("vin_used", bool(vin))
 
-        # Fill defaults and sanity-check cost range
-        result.setdefault("severity", "Moderate")
-        result.setdefault("damage_areas", [])
-        result.setdefault("damage_types", [])
-        result.setdefault("recommended_repairs", [])
-        result.setdefault("min_cost", 600)
-        result.setdefault("max_cost", 1500)
-        result.setdefault("confidence", 0.70)
-        result.setdefault("vin_used", bool(vin))
-
+        # Sanity clamp on cost range
         try:
-            min_c = float(result["min_cost"])
-            max_c = float(result["max_cost"])
+            min_c = float(output["min_cost"])
+            max_c = float(output["max_cost"])
             if max_c < min_c:
                 min_c, max_c = max_c, min_c
             if max_c - min_c > 6000:
                 mid = (min_c + max_c) / 2
                 min_c = mid - 1500
                 max_c = mid + 1500
-            result["min_cost"] = max(100.0, round(min_c))
-            result["max_cost"] = max(result["min_cost"] + 50.0, round(max_c))
+            output["min_cost"] = max(100.0, round(min_c))
+            output["max_cost"] = max(output["min_cost"] + 50.0, round(max_c))
         except Exception:
-            result["min_cost"] = 600
-            result["max_cost"] = 1500
+            output["min_cost"] = 600
+            output["max_cost"] = 1500
 
-        return result
+        return output
 
     except Exception as e:
-        print("AI Estimator Error:", e)
+        # Network / API error fallback
+        print("AI Estimator Error (Ontario calibrated):", e)
         return {
             "severity": "Moderate",
             "damage_areas": [],
@@ -441,16 +400,70 @@ Return strictly this JSON (no extra text):
         }
 
 
-# ---------------------------------------------------------
-# HELPERS: DB + ADMIN AUTH
-# ---------------------------------------------------------
+# ============================================================
+# PDF ESTIMATE GENERATOR (OPTIONAL)
+# ============================================================
 
-def save_estimate_to_db(
-    shop: ShopConfig,
-    phone: str,
-    vin: Optional[str],
-    result: dict,
-) -> str:
+
+def generate_estimate_pdf(shop: ShopConfig, phone: str, result: dict) -> Optional[str]:
+    if not REPORTLAB_AVAILABLE:
+        return None
+
+    safe_phone = phone.replace("+", "").replace(" ", "")
+    file_name = f"/tmp/estimate_{shop.id}_{safe_phone}.pdf"
+
+    c = canvas.Canvas(file_name, pagesize=letter)
+    width, height = letter
+
+    y = height - 50
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y, f"{shop.name} - AI Damage Estimate")
+
+    y -= 30
+    c.setFont("Helvetica", 12)
+    c.drawString(50, y, f"Customer phone: {phone}")
+    y -= 20
+
+    c.drawString(50, y, f"Severity: {result.get('severity', 'N/A')}")
+    y -= 20
+    c.drawString(
+        50,
+        y,
+        f"Estimated Cost: ${result.get('min_cost', 0):,.0f} - ${result.get('max_cost', 0):,.0f}",
+    )
+    y -= 30
+
+    areas = ", ".join(result.get("damage_areas", [])) or "N/A"
+    types = ", ".join(result.get("damage_types", [])) or "N/A"
+    repairs = ", ".join(result.get("recommended_repairs", [])) or "N/A"
+
+    c.drawString(50, y, f"Damage Areas: {areas}")
+    y -= 20
+    c.drawString(50, y, f"Damage Types: {types}")
+    y -= 20
+    c.drawString(50, y, f"Recommended Repairs: {repairs}")
+    y -= 20
+
+    conf = result.get("confidence", 0.0)
+    c.drawString(50, y, f"Model confidence: {conf:.2f}")
+    y -= 30
+
+    c.drawString(
+        50,
+        y,
+        "Note: This is an AI-assisted pre-estimate. Final pricing may vary after in-person inspection.",
+    )
+    c.showPage()
+    c.save()
+    return file_name
+
+
+# ============================================================
+# HELPERS: SAVE ESTIMATE + ADMIN AUTH
+# ============================================================
+
+
+def save_estimate_to_db(shop: ShopConfig, phone: str, vin: Optional[str], result: dict) -> str:
     db = SessionLocal()
     try:
         est = Estimate(
@@ -476,38 +489,50 @@ def save_estimate_to_db(
 def require_admin(request: Request):
     if not ADMIN_API_KEY:
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
-    incoming = (
-        request.headers.get("x-api-key")
-        or request.query_params.get("api_key")
-        or ""
-    )
+    incoming = request.headers.get("x-api-key") or request.query_params.get("api_key")
     if incoming != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-# ---------------------------------------------------------
-# ROUTES
-# ---------------------------------------------------------
+# ============================================================
+# APPOINTMENT SLOTS
+# ============================================================
+
+
+def get_appointment_slots(n: int = 3):
+    now = datetime.datetime.now()
+    tomorrow = now + datetime.timedelta(days=1)
+    hours = [9, 11, 14, 16]
+
+    slots = []
+    for h in hours:
+        dt = tomorrow.replace(hour=h, minute=0, second=0, microsecond=0)
+        if dt > now:
+            slots.append(dt)
+    return slots[:n]
+
+
+# ============================================================
+# ROUTES: HEALTHCHECK
+# ============================================================
+
 
 @app.get("/")
 def root():
     return {"status": "Backend is running!"}
 
 
-@app.post("/sms-webhook")
-async def sms_webhook(
-    request: Request,
-    shop: ShopConfig = Depends(get_shop),
-):
-    """
-    Twilio SMS Webhook:
-    - If user sends photos → AI estimate + booking options.
-    - If user replies 1/2/3 → confirm booking (and Calendar event if configured).
-    """
-    form = await request.form()
+# ============================================================
+# ROUTE: TWILIO SMS WEBHOOK
+# ============================================================
 
+
+@app.post("/sms-webhook")
+async def sms_webhook(request: Request, shop: ShopConfig = Depends(get_shop)):
+    form = await request.form()
     from_number = form.get("From")
     body = (form.get("Body") or "").strip()
+
     image_urls = extract_image_urls(form)
     vin = extract_vin(body)
 
@@ -516,18 +541,14 @@ async def sms_webhook(
     session_key = f"{shop.id}:{from_number}"
     session = SESSIONS.get(session_key)
 
-    # 1) Booking reply: "1", "2", "3"
+    # Booking selection flow
     if session and session.get("awaiting_time") and body in {"1", "2", "3"}:
-        try:
-            idx = int(body) - 1
-        except ValueError:
-            idx = -1
+        idx = int(body) - 1
+        slots = session["slots"]
 
-        slots: List[datetime.datetime] = session.get("slots", [])
         if 0 <= idx < len(slots):
             chosen = slots[idx]
 
-            # Optional Google Calendar integration
             create_calendar_event(
                 shop=shop,
                 start_dt=chosen,
@@ -536,8 +557,7 @@ async def sms_webhook(
             )
 
             reply.message(
-                f"Your appointment at {shop.name} is booked for "
-                f"{chosen.strftime('%a %b %d at %I:%M %p')}."
+                f"Your appointment is booked for {chosen.strftime('%a %b %d at %I:%M %p')}."
             )
 
             session["awaiting_time"] = False
@@ -545,9 +565,10 @@ async def sms_webhook(
 
             return Response(content=str(reply), media_type="application/xml")
 
-    # 2) New AI estimate (if images are present)
+    # Multi-image AI estimate
     if image_urls:
         result = await estimate_damage_from_images(image_urls, vin, shop)
+
         estimate_id = save_estimate_to_db(shop, from_number, vin, result)
 
         severity = result["severity"]
@@ -555,55 +576,53 @@ async def sms_webhook(
         max_cost = result["max_cost"]
         cost_range = f"${min_cost:,.0f} - ${max_cost:,.0f}"
 
-        areas = (
-            ", ".join(result["damage_areas"])
-            if result["damage_areas"]
-            else "Multiple precise panels identified"
-        )
-        types = (
-            ", ".join(result["damage_types"])
-            if result["damage_types"]
-            else "Detailed damage types identified"
-        )
+        areas = ", ".join(result["damage_areas"]) if result["damage_areas"] else "specific panels detected"
+        types = ", ".join(result["damage_types"]) if result["damage_types"] else "detailed damage types detected"
 
         slots = get_appointment_slots()
         SESSIONS[session_key] = {"awaiting_time": True, "slots": slots}
 
         lines = [
-            f"AI Damage Estimate - {shop.name}",
+            f"AI Damage Estimate for {shop.name}",
             f"Severity: {severity}",
-            f"Estimated Repair Range (Ontario 2025): {cost_range}",
+            f"Estimated Cost (Ontario 2025): {cost_range}",
             f"Panels: {areas}",
             f"Damage Types: {types}",
             f"Estimate ID (internal): {estimate_id}",
         ]
+
         if vin and result.get("vin_used"):
             lines.append(f"VIN used for calibration: {vin}")
 
         lines.append("")
         lines.append("Reply with a number to book an in-person estimate:")
 
-        for i, s in enumerate(slots, start=1):
+        for i, s in enumerate(slots, 1):
             lines.append(f"{i}) {s.strftime('%a %b %d at %I:%M %p')}")
+
+        # Generate PDF quietly (if available)
+        generate_estimate_pdf(shop, from_number, result)
 
         reply.message("\n".join(lines))
         return Response(content=str(reply), media_type="application/xml")
 
-    # 3) No images → instruct user
-    intro_lines = [
-        f"Thanks for messaging {shop.name}! 👋",
+    # Default prompt (no images)
+    intro = [
+        f"Thanks for messaging {shop.name}.",
         "",
         "To get an AI-powered pre-estimate:",
-        "• Send 1–5 clear photos of the damage",
-        "• Optional: include your 17-character VIN in the text",
+        "- Send 1–5 clear photos of the damage",
+        "- Optional: include your 17-character VIN in the text",
     ]
-    reply.message("\n".join(intro_lines))
+
+    reply.message("\n".join(intro))
     return Response(content=str(reply), media_type="application/xml")
 
 
-# ---------------------------------------------------------
-# ADMIN API (simple JSON dashboard backend)
-# ---------------------------------------------------------
+# ============================================================
+# ADMIN DASHBOARD API (very lightweight)
+# ============================================================
+
 
 @app.get("/admin/estimates")
 def list_estimates(
@@ -644,7 +663,6 @@ def get_estimate(estimate_id: str, request: Request):
         e = db.query(Estimate).filter(Estimate.id == estimate_id).first()
         if not e:
             raise HTTPException(status_code=404, detail="Estimate not found")
-
         return {
             "id": e.id,
             "shop_id": e.shop_id,
@@ -661,3 +679,99 @@ def get_estimate(estimate_id: str, request: Request):
         }
     finally:
         db.close()
+
+
+# ============================================================
+# STRIPE BILLING ENDPOINTS (minimal / optional)
+# ============================================================
+
+
+class CheckoutRequest(BaseModel):
+    shop_id: str
+    success_url: str
+    cancel_url: str
+
+
+@app.post("/billing/create-checkout-session")
+def create_checkout_session(payload: CheckoutRequest):
+    if not STRIPE_API_KEY or not STRIPE_PRICE_ID:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=payload.success_url + "?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=payload.cancel_url,
+            metadata={"shop_id": payload.shop_id},
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/billing/stripe-webhook")
+async def stripe_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="Stripe-Signature"),
+):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Stripe webhook secret not set")
+
+    body = await request.body()
+    try:
+        event = stripe.Webhook.construct_event(
+            payload=body,
+            sig_header=stripe_signature,
+            secret=STRIPE_WEBHOOK_SECRET,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
+
+    event_type = event["type"]
+    data = event["data"]["object"]
+
+    db = SessionLocal()
+    try:
+        if event_type == "checkout.session.completed":
+            shop_id = data.get("metadata", {}).get("shop_id")
+            subscription_id = data.get("subscription")
+            customer_id = data.get("customer")
+
+            if shop_id:
+                record = db.query(ShopBilling).filter(ShopBilling.shop_id == shop_id).first()
+                if not record:
+                    record = ShopBilling(shop_id=shop_id)
+                    db.add(record)
+                record.stripe_customer_id = customer_id
+                record.stripe_subscription_id = subscription_id
+                record.subscription_status = "active"
+                db.commit()
+
+        elif event_type == "customer.subscription.updated":
+            subscription_id = data.get("id")
+            status = data.get("status")
+            record = db.query(ShopBilling).filter(
+                ShopBilling.stripe_subscription_id == subscription_id
+            ).first()
+            if record:
+                record.subscription_status = status
+                db.commit()
+
+    finally:
+        db.close()
+
+    return {"received": True}
+
+
+# ============================================================
+# LOCAL ENTRYPOINT (Railway uses `python main.py`)
+# ============================================================
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
